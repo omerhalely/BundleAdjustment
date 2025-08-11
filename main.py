@@ -40,12 +40,14 @@ def reprojection_error(u, v, X, P):
     return error
 
 
-def dictionary_intersection(d):
-    pass
+def depth_estimation(frame, height, width, d, keypoints, C):
+    for key in d:
+        matching_points = np.array(list(d[key].items()))
+        # pts1 = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        pts1 = keypoints[0][matching_points[:, 0], :]
+        pts2 = keypoints[key + 1][matching_points[:, 1], :]
 
-
-def depth_estimation(frame, height, width, pts1, pts2, C):
-    F, mask = cv2.findFundamentalMat(pts2, pts1, cv2.FM_RANSAC, 0.1, 0.99)
+        F, mask = cv2.findFundamentalMat(pts2, pts1, cv2.FM_RANSAC, 0.1, 0.99)
     # pts1 = pts1[mask[:, 0] == 1]
     # pts2 = pts2[mask[:, 0] == 1]
     E = C.T @ F @ C
@@ -102,6 +104,12 @@ def depth_estimation(frame, height, width, pts1, pts2, C):
     return R, t
 
 
+def dictionary_intersection(d):
+    for key in d:
+        d[key] = {k: d[key][k] for k in d[key] if k in d[(key + 1) % len(d)]}
+    return d
+
+
 def bundle_adjustment(dataset, K):
     orb = cv2.ORB_create(5000)
     bf = cv2.BFMatcher(cv2.NORM_HAMMING)
@@ -121,7 +129,7 @@ def bundle_adjustment(dataset, K):
     for i in range(K, len(dataset)):
         reference_keypoints = kp[0]
         reference_descriptor = des[0]
-        j = 1
+        j = 0
         for descriptor in des[1:]:
             matches = bf.knnMatch(reference_descriptor, descriptor, k=2)
 
@@ -140,9 +148,10 @@ def bundle_adjustment(dataset, K):
 
             j += 1
 
-        matching_points[1] = {k : matching_points[1][k] for k in matching_points[1] if k in matching_points[2]}
-        matching_points[2] = {k : matching_points[2][k] for k in matching_points[2] if k in matching_points[1]}
-
+        # matching_points[1] = {k : matching_points[1][k] for k in matching_points[1] if k in matching_points[2]}
+        # matching_points[2] = {k : matching_points[2][k] for k in matching_points[2] if k in matching_points[1]}
+        matching_points_intersection = dictionary_intersection(matching_points)
+        depth_estimation(frames[0], height, width, matching_points_intersection, kp, C)
         frames, kp, des = add_next_frame(
             dataset=dataset,
             next_frame=i,
