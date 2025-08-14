@@ -3,6 +3,10 @@ import pykitti
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+from Frame import Frame
+from MatchingPoints import MatchingPoints
 
 
 def unpack_params(dataset):
@@ -40,74 +44,53 @@ def reprojection_error(u, v, X, P):
     return error
 
 
-def depth_estimation(frame, height, width, d, keypoints, C):
-    for key in d:
-        matching_points = np.array(list(d[key].items()))
-        # pts1 = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-        pts1 = keypoints[0][matching_points[:, 0], :]
-        pts2 = keypoints[key + 1][matching_points[:, 1], :]
+def depth_estimation(frames, matching_points, C, K):
+    depth_image = np.zeros_like(frames[0].frame)
+    reference_indices = list(matching_points.keys())
+    reference_points = np.array([frames[0].features[reference_indices[i]].pt for i in range(len(reference_indices))])
+    projection_matrices = [C @ np.concatenate((np.eye(3), np.zeros((3, 1))), axis=1)]
+    points = [reference_points]
+    for k in range(1, K):
+        points_k = np.array([frames[k].features[matching_points[reference_indices[i]][k - 1]].pt for i in range(len(reference_indices))])
+        points.append(points_k)
 
-        F, mask = cv2.findFundamentalMat(pts2, pts1, cv2.FM_RANSAC, 0.1, 0.99)
-    # pts1 = pts1[mask[:, 0] == 1]
-    # pts2 = pts2[mask[:, 0] == 1]
-    E = C.T @ F @ C
+        F, mask = cv2.findFundamentalMat(points_k, reference_points, cv2.FM_RANSAC, 0.1, 0.99)
+        E = C.T @ F @ C
+        _, R, t, _ = cv2.recoverPose(E, points_k, reference_points, cameraMatrix=C)
+        P = C @ np.concatenate((R, t), axis=1)
+        projection_matrices.append(P)
 
-    _, R, t, _ = cv2.recoverPose(E, pts2, pts1, cameraMatrix=C)
+    for i in range(len(projection_matrices)):
+        frames[i].set_projection_matrix(projection_matrices[i], C)
 
-    P = C @ np.concatenate((np.eye(3), np.zeros((3, 1))), axis=1)
-    P_prime = C @ np.concatenate((R, t), axis=1)
+    points = np.array(points)
+    for i in range(points.shape[1]):
+        A = None
+        for (j, point) in enumerate(points[:, i, :]):
+            P = projection_matrices[j]
+            P1 = P[0, :]
+            P2 = P[1, :]
+            P3 = P[2, :]
+            u, v = point
+            if A is None:
+                A = np.array([
+                    u * P3 - P1,
+                    v * P3 - P2,
+                ])
+            else:
+                new_rows = np.array([
+                    u * P3 - P1,
+                    v * P3 - P2,
+                ])
+                A = np.concatenate((A, new_rows), axis=0)
 
-    P1 = P[0, :]
-    P2 = P[1, :]
-    P3 = P[2, :]
-    P_prime1 = P_prime[0, :]
-    P_prime2 = P_prime[1, :]
-    P_prime3 = P_prime[2, :]
-    errors = []
-    depth = np.zeros((height, width), dtype=np.float32)
-    for (pt1, pt2) in zip(pts1, pts2):
-        u1, v1 = pt1
-        u2, v2 = pt2
-
-        A = np.array([
-            u1 * P3 - P1,
-            v1 * P3 - P2,
-            u2 * P_prime3 - P_prime1,
-            v2 * P_prime3 - P_prime2
-        ])
-
-        _, _, Vt = np.linalg.svd(A)
+        _, _, Vt = np.linalg.svd(A.T @ A)
         X = Vt[-1]
         X = X[:-1] / X[-1]
-
-        # eig_values, eig_vectors = np.linalg.eig(A)
-        # X = eig_vectors[:, np.argmin(np.abs(eig_values))]
-        # X = X[:-1] / X[-1]
-
-        error = reprojection_error(u1, v1, X, P)
-
         depth_value = np.linalg.norm(X)
-        if depth_value > 80:
-            continue
-        color = 255 * depth_value / 80
-        cv2.circle(frame, (int(u1), int(v1)), 3, color, 2)
-        depth[int(v1), int(u1)] = depth_value
-        errors.append(error)
+        depth_image[int(points[0, 0, 1]), int(points[0, 0, 0])] = depth_value
 
-    print(np.mean(np.array(errors)))
-    depth[depth > 80] = 0
-
-    fig, axis = plt.subplots(1, 2)
-    axis[0].imshow(frame)
-    axis[1].imshow(depth)
-    plt.show()
     return R, t
-
-
-def dictionary_intersection(d):
-    for key in d:
-        d[key] = {k: d[key][k] for k in d[key] if k in d[(key + 1) % len(d)]}
-    return d
 
 
 def bundle_adjustment(dataset, K):
@@ -115,51 +98,37 @@ def bundle_adjustment(dataset, K):
     bf = cv2.BFMatcher(cv2.NORM_HAMMING)
     C = dataset.calib.P_rect_00[:, :3]
 
-    frames = [np.array(dataset.get_cam0(i)) for i in range(K)]
-    height, width = frames[0].shape
-
-    features = [orb.detectAndCompute(frames[i], None) for i in range(len(frames))]
-    kp = [features[i][0] for i in range(len(features))]
-    des = [features[i][1] for i in range(len(features))]
+    frames = []
+    matching_points = MatchingPoints()
 
     rotations = [np.eye(3)]
     translations = [np.zeros((3, 1), dtype=np.float32)]
     trajectory = np.array([]).reshape(0, 2)
-    matching_points = {}
-    for i in range(K, len(dataset)):
-        reference_keypoints = kp[0]
-        reference_descriptor = des[0]
-        j = 0
-        for descriptor in des[1:]:
-            matches = bf.knnMatch(reference_descriptor, descriptor, k=2)
 
-            matching_points[j] = {}
-            for m, n in matches:
-                if m.distance < 0.75 * n.distance:
-                    matching_points[j][m.queryIdx] = m.trainIdx
+    for i in tqdm(range(len(dataset))):
+        if len(frames) < K:
+            new_frame = Frame(np.array(dataset.get_cam0(i)))
+            new_frame.process_frame(orb)
+            frames.append(new_frame)
+            continue
 
+        for frame in frames[1:]:
+            matching_points.add(frames[0].match(frame, bf))
+        matching_points.unique()
+        R, t = depth_estimation(frames, matching_points.matching_points, C, K)
 
-            # R, t = depth_estimation(frames[0], height, width, pts1, pts2, C)
-            # translations.append(translations[-1] + rotations[-1] @ t)
-            # rotations.append(rotations[-1] @ R)
-            # trajectory = np.concatenate((trajectory, np.array(
-            #     [[translations[-1][0, 0], translations[-1][2, 0]]]
-            # )))
+        translations.append(translations[-1] + rotations[-1] @ t)
+        rotations.append(rotations[-1] @ R)
+        trajectory = np.concatenate((trajectory, np.array(
+            [[translations[-1][0, 0], translations[-1][2, 0]]]
+        )))
 
-            j += 1
+        frames.pop(0)
+        new_frame = Frame(np.array(dataset.get_cam0(i)))
+        new_frame.process_frame(orb)
+        frames.append(new_frame)
 
-        # matching_points[1] = {k : matching_points[1][k] for k in matching_points[1] if k in matching_points[2]}
-        # matching_points[2] = {k : matching_points[2][k] for k in matching_points[2] if k in matching_points[1]}
-        matching_points_intersection = dictionary_intersection(matching_points)
-        depth_estimation(frames[0], height, width, matching_points_intersection, kp, C)
-        frames, kp, des = add_next_frame(
-            dataset=dataset,
-            next_frame=i,
-            orb=orb,
-            frames=frames,
-            kp=kp,
-            des=des
-        )
+        matching_points.reset()
 
     poses = np.array([]).reshape(0, 2)
     rotations = [np.eye(3)]
@@ -179,9 +148,8 @@ def bundle_adjustment(dataset, K):
             [[translations[-1][0, 0], translations[-1][2, 0]]]
         )))
 
-    fig, axis = plt.subplots(1, 2)
-    axis[0].plot(poses[:, 0], poses[:, 1])
-    axis[1].plot(trajectory[:, 0], trajectory[:, 1])
+    plt.plot(poses[:, 0], poses[:, 1])
+    plt.plot((855 / 34.4) * trajectory[:, 0], (1272 / 50.95) * trajectory[:, 1])
     plt.show()
 
 
