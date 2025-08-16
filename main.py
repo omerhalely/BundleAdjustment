@@ -50,10 +50,24 @@ def reprojection_error(P, X, x, height, width, device):
     return error
 
 
-def camera_projection_function(projection_matrix, world_coordinates):
+def create_projection_matrix(C, R, t):
+    projection_matrix = torch.concatenate((R, t), dim=-1)
+    projection_matrix = projection_matrix.unfold(0, 3, 3)
+    projection_matrix = torch.transpose(projection_matrix @ C.T, dim0=1, dim1=2)
+    projection_matrix = torch.reshape(projection_matrix, (projection_matrix.shape[0] * projection_matrix.shape[1], -1))
+    return projection_matrix
+
+
+def camera_projection_function(rotation_matrix, translation_vector, world_coordinates):
     ones_column = torch.ones(world_coordinates.shape[0], 1, requires_grad=False).to(device)
     homogeneous_coordinates = torch.concatenate((world_coordinates, ones_column), dim=-1)
-    width, height = 1200, 375
+    width, height = 1242, 375
+    C = torch.tensor([[721.5377, 0.0000, 609.5593],
+                            [0.0000, 721.5377, 172.8540],
+                            [0.0000, 0.0000, 1.0000]], device=rotation_matrix.device, dtype=torch.float64)
+    P0 = C @ torch.concatenate((torch.eye(3, device=rotation_matrix.device, dtype=torch.float64),
+                                torch.zeros(3, 1, device=rotation_matrix.device, dtype=torch.float64)), dim=1)
+    projection_matrix = torch.concatenate((P0, create_projection_matrix(C, rotation_matrix, translation_vector)), dim=0)
     camera_projection = (projection_matrix @ homogeneous_coordinates.T).T
     camera_projection = torch.reshape(camera_projection, (camera_projection.shape[0], -1, 3))
     camera_projection = camera_projection / torch.unsqueeze(camera_projection[:, :, -1], dim=-1)
@@ -64,9 +78,11 @@ def camera_projection_function(projection_matrix, world_coordinates):
     return camera_projection
 
 
-def LMA_optimization(frames, camera_coordinates, world_coordinates, projection_matrix, height, width, device):
+def LMA_optimization(frames, camera_coordinates, world_coordinates, rotation_matrix, translation_vector, height, width, C, device):
     ones_column = torch.ones(world_coordinates.shape[0], 1, requires_grad=False).to(device)
     homogeneous_coordinates = torch.concatenate((world_coordinates, ones_column), dim=-1)
+
+    projection_matrix = create_projection_matrix(C, rotation_matrix, translation_vector)
 
     camera_projection = (projection_matrix @ homogeneous_coordinates.T).T
     camera_projection = torch.reshape(camera_projection, (camera_projection.shape[0], -1, 3))
@@ -76,48 +92,58 @@ def LMA_optimization(frames, camera_coordinates, world_coordinates, projection_m
     camera_projection[:, :, 1] /= height
     camera_projection = torch.flatten(camera_projection)
 
-    params = (projection_matrix, world_coordinates)
-    J_P, J_X = torch.autograd.functional.jacobian(camera_projection_function, params)
-    J_P = torch.flatten(J_P, start_dim=1)
+    params = (rotation_matrix[3:, :], translation_vector[3:, :], world_coordinates)
+    J_R, J_t, J_X = torch.autograd.functional.jacobian(camera_projection_function, params)
+    J_R = torch.flatten(J_R, start_dim=1)
+    J_t = torch.flatten(J_t, start_dim=1)
     J_X = torch.flatten(J_X, start_dim=1)
-    J = torch.concatenate((J_P, J_X), dim=1)
+    J = torch.concatenate((J_R, J_t, J_X), dim=1)
 
-    lambda0 = 1e-3
+    lambda0 = 0.1
     JT_J = J.T @ J
     A = JT_J + lambda0 * torch.diag(torch.diag(JT_J))
     b = camera_coordinates - camera_projection
     delta = torch.linalg.inv(A) @ J.T @ b
-    delta_P = delta[:3 * len(frames) * 4]
-    delta_X = delta[3 * len(frames) * 4:]
+    delta_R = delta[:18]
+    delta_t = delta[18:18 + 6]
+    delta_X = delta[18 + 6:]
 
-    delta_P = torch.reshape(delta_P, projection_matrix.shape)
-    delta_X = torch.reshape(delta_X, world_coordinates.shape)
-    return delta_P, delta_X
+    delta_R = torch.reshape(delta_R, params[0].shape)
+    delta_t = torch.reshape(delta_t, params[1].shape)
+    delta_X = torch.reshape(delta_X, params[2].shape)
+    return delta_R, delta_t, delta_X
 
 
 def depth_estimation(frames, matching_points, C, K, device):
-    depth_image = np.zeros_like(frames[0].frame)
+    # depth_image = np.zeros_like(frames[0].frame)
     reference_indices = list(matching_points.keys())
     reference_points = np.array([frames[0].features[reference_indices[i]].pt for i in range(len(reference_indices))])
     projection_matrices = [C @ np.concatenate((np.eye(3), np.zeros((3, 1))), axis=1)]
     points = [reference_points]
+    F_matrices = []
     ransac_mask = None
     for k in range(1, K):
         points_k = np.array([frames[k].features[matching_points[reference_indices[i]][k - 1]].pt for i in range(len(reference_indices))])
         points.append(points_k)
 
-        F, mask = cv2.findFundamentalMat(points_k, reference_points, cv2.FM_RANSAC, 0.1, 0.99)
+        F, mask = cv2.findFundamentalMat(points_k, reference_points, cv2.FM_RANSAC)
+        F_matrices.append(F)
         if ransac_mask is None:
             ransac_mask = mask
         else:
             ransac_mask = np.logical_and(ransac_mask, mask)
+
+    for i in range(len(points)):
+        points[i] = points[i][ransac_mask[:, 0] == 1]
+
+    reference_points = points[0]
+    for k in range(1, K):
+        points_k = points[k]
+        F = F_matrices[k - 1]
         E = C.T @ F @ C
         _, R, t, _ = cv2.recoverPose(E, points_k, reference_points, cameraMatrix=C)
         P = C @ np.concatenate((R, t), axis=1)
         projection_matrices.append(P)
-
-    for i in range(len(points)):
-        points[i] = points[i][ransac_mask[:, 0] == 1]
 
     for i in range(len(projection_matrices)):
         frames[i].set_projection_matrix(projection_matrices[i], C)
@@ -151,8 +177,8 @@ def depth_estimation(frames, matching_points, C, K, device):
         world_coordinates[i, :] = X[:-1]
 
         X = X[:-1]
-        depth_value = np.linalg.norm(X)
-        depth_image[int(points[0, 0, 1]), int(points[0, 0, 0])] = depth_value
+        # depth_value = np.linalg.norm(X)
+        # depth_image[int(points[0, 0, 1]), int(points[0, 0, 0])] = depth_value
 
     height, width = frames[0].height, frames[0].width
     camera_coordinates = torch.from_numpy(points).requires_grad_(False).to(device)
@@ -162,29 +188,38 @@ def depth_estimation(frames, matching_points, C, K, device):
     camera_coordinates = torch.flatten(camera_coordinates)
     world_coordinates = torch.from_numpy(world_coordinates).requires_grad_(True).to(device)
 
-    projection_matrix = None
-    for i in range(len(frames)):
+    rotation_matrix = torch.from_numpy(frames[0].R).to(device).requires_grad_(True)
+    translation_vector = torch.from_numpy(frames[0].t).to(device).requires_grad_(True)
+    for i in range(1, len(frames)):
         frames[i].to_tensor(device)
-        if projection_matrix is None:
-            projection_matrix = frames[i].P
-        else:
-            projection_matrix = torch.concatenate((projection_matrix, frames[i].P), dim=0)
-    projection_matrix.to(device).requires_grad_(True)
-
-    max_iter = 2
-    # error = reprojection_error(projection_matrix, world_coordinates, camera_coordinates, height, width, device)
-    for i in range(max_iter):
-        delta_P, delta_X = LMA_optimization(frames, camera_coordinates, world_coordinates, projection_matrix, height, width, device)
-
-        projection_matrix += delta_P
-        world_coordinates += delta_X
-        # error = reprojection_error(projection_matrix, world_coordinates, camera_coordinates, height, width, device)
+        if i == 1:
+            initial_R = frames[i].R
+            initial_t = frames[i].t
+            initial_R_t = torch.concatenate((initial_R, initial_t), dim=-1)
+        rotation_matrix = torch.concatenate((rotation_matrix, frames[i].R), dim=0)
+        translation_vector = torch.concatenate((translation_vector, frames[i].t), dim=0)
 
     C = torch.from_numpy(C).to(device)
-    P = projection_matrix.unfold(0, 3, 3)
-    R_t = P @ torch.linalg.inv(C.T)
-    R_t = torch.transpose(R_t, dim0=1, dim1=-1)
-    return R_t[1].cpu().detach().numpy()
+    max_iter = 2
+    projection_matrix = create_projection_matrix(C, rotation_matrix, translation_vector)
+    error = reprojection_error(projection_matrix, world_coordinates, camera_coordinates, height, width, device)
+    # print(error)
+    for i in range(max_iter):
+        delta_R, delta_t, delta_X = LMA_optimization(frames, camera_coordinates, world_coordinates, rotation_matrix, translation_vector, height, width, C, device)
+
+        rotation_matrix[3:, :] += delta_R
+        translation_vector[3:, :] += delta_t
+        world_coordinates += delta_X
+
+        projection_matrix = create_projection_matrix(C, rotation_matrix, translation_vector)
+        error = reprojection_error(projection_matrix, world_coordinates, camera_coordinates, height, width, device)
+        print(error)
+
+    # P = projection_matrix.unfold(0, 3, 3)
+    # R_t = P @ torch.linalg.inv(C.T)
+    # R_t = torch.transpose(R_t, dim0=1, dim1=-1)
+    R_t = torch.concatenate((rotation_matrix[3:6, :], translation_vector[3:6, :]), dim=-1)
+    return R_t.cpu().detach().numpy(), initial_R_t.cpu().detach().numpy()
 
 
 def bundle_adjustment(dataset, K, device):
@@ -197,7 +232,13 @@ def bundle_adjustment(dataset, K, device):
 
     rotations = [np.eye(3)]
     translations = [np.zeros((3, 1), dtype=np.float32)]
+
+    initial_rotations = [np.eye(3)]
+    initial_translations = [np.zeros((3, 1), dtype=np.float32)]
+
     trajectory = np.array([]).reshape(0, 2)
+
+    initial_trajectory = np.array([]).reshape(0, 2)
 
     for i in tqdm(range(len(dataset))):
         if len(frames) < K:
@@ -209,15 +250,24 @@ def bundle_adjustment(dataset, K, device):
         for frame in frames[1:]:
             matching_points.add(frames[0].match(frame, bf))
         matching_points.unique()
-        R_t = depth_estimation(frames, matching_points.matching_points, C, K, device)
+        R_t, initial_R_t = depth_estimation(frames, matching_points.matching_points, C, K, device)
 
         R = R_t[:, :-1]
         t = np.reshape(R_t[:, -1], (R_t.shape[0], 1))
+
+        initial_R = initial_R_t[:, :-1]
+        initial_t = np.reshape(initial_R_t[:, -1], (initial_R_t.shape[0], 1))
 
         translations.append(translations[-1] + rotations[-1] @ t)
         rotations.append(rotations[-1] @ R)
         trajectory = np.concatenate((trajectory, np.array(
             [[translations[-1][0, 0], translations[-1][2, 0]]]
+        )))
+
+        initial_translations.append(initial_translations[-1] + initial_rotations[-1] @ initial_t)
+        initial_rotations.append(initial_rotations[-1] @ initial_R)
+        initial_trajectory = np.concatenate((initial_trajectory, np.array(
+            [[initial_translations[-1][0, 0], initial_translations[-1][2, 0]]]
         )))
 
         frames.pop(0)
@@ -247,6 +297,7 @@ def bundle_adjustment(dataset, K, device):
 
     plt.plot(poses[:, 0], poses[:, 1])
     plt.plot(trajectory[:, 0], trajectory[:, 1])
+    plt.plot(initial_trajectory[:, 0], initial_trajectory[:, 1])
     plt.show()
 
 
