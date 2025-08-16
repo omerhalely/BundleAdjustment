@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 
 
 class Frame:
@@ -28,3 +29,8 @@ class Frame:
         R_t = np.linalg.inv(C) @ P
         self.R = R_t[:, :-1]
         self.t = np.reshape(R_t[:, -1], (3, 1))
+
+    def to_tensor(self, device):
+        self.P = torch.from_numpy(self.P).requires_grad_(True).to(device)
+        self.R = torch.from_numpy(self.R).requires_grad_(True).to(device)
+        self.t = torch.from_numpy(self.t).requires_grad_(True).to(device)
